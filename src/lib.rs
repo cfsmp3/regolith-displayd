@@ -11,7 +11,7 @@ use core::fmt;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use mirror::SwayOutput;
-use monitor::{LogicalMonitor, Monitor, MonitorApply};
+use monitor::{LogicalMonitor, Monitor, MonitorApply, MonitorTransform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -68,8 +68,8 @@ struct Confirmation {
     output: String,
     /// When the change is reverted if the user hasn't answered.
     deadline: Instant,
-    /// The sway commands that restore the configuration from before the change.
-    previous: Vec<String>,
+    /// The outputs as they were before the change, which a revert brings back.
+    previous: Vec<SwayOutput>,
     /// The primary chosen by the last Apply, and the one from before the change.
     primary: Arc<Mutex<Option<PrimaryChoice>>>,
     previous_primary: Option<PrimaryChoice>,
@@ -123,19 +123,8 @@ pub struct KanshiPaths {
 impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let mut state = self.manager.lock().await.clone();
-        let remembered = self.primary.lock().await.clone();
-        let chosen = match &remembered {
-            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
-                Some(connector.clone())
-            }
-            _ => match get_kanshi_paths().await {
-                Ok(paths) => state.saved_primary(&paths),
-                Err(_) => None,
-            },
-        };
-        state.mark_primary(chosen.as_deref());
-        state
+        let state = self.manager.lock().await.clone();
+        self.reported(state).await
     }
 
     /// Verify (0), or apply at once, temporarily (1) or persistently (2).
@@ -156,18 +145,25 @@ impl DisplayServer {
         let called = Instant::now();
         debug!("Configuration Method: {method}");
         let mut manager_obj = self.manager.lock().await;
+        // The outputs as they are now, which a revert brings back.
+        let outputs = {
+            let _sway = self.sway_connection.lock().await;
+            mirror::get_outputs().await.map_err(|e| e.to_string())
+        };
         // Monitors plugged in or unplugged since the watcher last looked:
         // the configuration was made for other monitors, so refuse it rather
         // than save it as their profile. The watcher reports the change,
         // moving the serial on, and the panel reads the new state.
-        match manager_obj.get_monitor_info(&self.sway_connection).await {
-            Ok((monitors, _)) if !same_monitors(&manager_obj.monitors, &monitors) => {
-                error!("Invalid configuration recieved for method apply_monitors_config: the monitors changed");
-                return Err(zbus::fdo::Error::InvalidArgs(String::from(
-                    "The monitors changed",
-                )));
+        match &outputs {
+            Ok(outputs) => {
+                let (monitors, _) = manager_obj.monitor_info(outputs);
+                if !same_monitors(&manager_obj.monitors, &monitors) {
+                    error!("Invalid configuration recieved for method apply_monitors_config: the monitors changed");
+                    return Err(zbus::fdo::Error::InvalidArgs(String::from(
+                        "The monitors changed",
+                    )));
+                }
             }
-            Ok(_) => {}
             Err(e) => error!("Error getting output information from sway: {e}"),
         }
         debug!("Serial: {} {}", manager_obj.serial, serial);
@@ -191,29 +187,51 @@ impl DisplayServer {
                 )));
             }
         }
-        // Verify the whole configuration before changing anything: an Apply
-        // that cannot be satisfied is rejected atomically, and a verify call
-        // must leave no state behind, nor touch a change awaiting an answer.
-        for mutter_logical_mointor in &mutter_logical_monitors {
-            mutter_logical_mointor.verify(
-                &self.sway_connection,
-                &manager_obj.monitors,
-                &manager_obj.logical_monitors,
-            )?;
+        // Which monitor of each mirrored logical monitor shows it does not
+        // depend on the order the caller lists them in (see
+        // `order_mirrors`). A configuration that then repeats the state last
+        // reported exactly is accepted as it is: the rules for a new layout
+        // are not imposed on an arrangement the outputs already have, which
+        // may have been set up outside Settings (a mirror in a mode of
+        // another size, or whose source sits later in the layout, or a layout
+        // from sway's configuration that Mutter's rules refuse). It changes no
+        // output; a persistent repeat still asks to keep or revert, and is
+        // saved if kept.
+        let reported = self.reported(manager_obj.clone()).await;
+        let mut mutter_logical_monitors = mutter_logical_monitors;
+        reported.order_mirrors(&mut mutter_logical_monitors);
+        let restated = reported.restates_state(&mutter_logical_monitors);
+        if !restated {
+            // Verify the whole configuration before changing anything: an
+            // Apply that cannot be satisfied is rejected atomically, and a
+            // verify call must leave no state behind, nor touch a change
+            // awaiting an answer.
+            let can_mirror = outputs.as_deref().is_ok_and(mirror::can_mirror);
+            for mutter_logical_mointor in &mutter_logical_monitors {
+                mutter_logical_mointor.verify(
+                    &manager_obj.monitors,
+                    &manager_obj.logical_monitors,
+                    can_mirror,
+                )?;
+            }
+            verify_layout(&mutter_logical_monitors, &manager_obj.monitors)?;
         }
-        verify_layout(&mutter_logical_monitors, &manager_obj.monitors)?;
         if method == 0 {
             return Ok(());
         }
+        let previous = outputs
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Cannot read the outputs: {e}")))?;
 
-        // verify_layout made sure there is exactly one primary.
+        // verify_layout made sure there is exactly one primary, and a repeat
+        // names the one reported.
         let primary = mutter_logical_monitors
             .iter()
             .find(|logical| logical.is_primary())
             .map(|logical| logical.connector().to_string())
             .unwrap_or_default();
 
-        let (profile_name, mut profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
+        let (profile_name, mut profile_buf) =
+            manager_obj.kanshi_profile(&mutter_logical_monitors, &previous);
         if let Some(monitor) = manager_obj
             .monitors
             .iter()
@@ -225,15 +243,18 @@ impl DisplayServer {
             );
             profile_buf.splice(0..0, line.into_bytes());
         }
-        let commands = manager_obj.sway_commands(&mutter_logical_monitors);
-        // What a revert goes back to: the outputs as they are now, which may
-        // be a persistent change still awaiting an answer, as in GNOME.
-        let previous = current_sway_commands(&self.sway_connection)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Cannot read the outputs: {e}")))?;
+        // A repeat leaves every output as it is.
+        let commands = if restated {
+            Vec::new()
+        } else {
+            manager_obj.sway_commands(&mutter_logical_monitors, &previous)
+        };
+        // What a revert goes back to is `previous`: the outputs as they were
+        // before this change, which may be a persistent change still awaiting
+        // an answer, as in GNOME.
         if let Err(e) = run_sway(&self.sway_connection, &commands).await {
             error!("Error applying the configuration: {e}");
-            if let Err(e) = run_sway(&self.sway_connection, &previous).await {
+            if let Err(e) = restore_outputs(&self.sway_connection, &previous).await {
                 error!("Error restoring the configuration: {e}");
             }
             return Err(zbus::fdo::Error::Failed(e));
@@ -271,7 +292,7 @@ impl DisplayServer {
                 id,
                 manager: Arc::clone(&self.manager),
                 sway_connection: Arc::clone(&self.sway_connection),
-                output: prompt_output(&self.sway_connection).await,
+                output: prompt_output(&self.sway_connection, &previous).await,
                 deadline: called + CONFIRM_TIMEOUT,
                 previous,
                 primary: Arc::clone(&self.primary),
@@ -314,6 +335,24 @@ impl DisplayServer {
 }
 
 impl DisplayServer {
+    /// `state` as GetCurrentState reports it, with its primary marked: the
+    /// one chosen last for these monitors, else the one saved with their
+    /// profile, else Mutter's default (see [`DisplayManager::mark_primary`]).
+    async fn reported(&self, mut state: DisplayManager) -> DisplayManager {
+        let remembered = self.primary.lock().await.clone();
+        let chosen = match &remembered {
+            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
+                Some(connector.clone())
+            }
+            _ => match get_kanshi_paths().await {
+                Ok(paths) => state.saved_primary(&paths),
+                Err(_) => None,
+            },
+        };
+        state.mark_primary(chosen.as_deref());
+        state
+    }
+
     pub async fn new(
         manager: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
@@ -414,10 +453,21 @@ impl DisplayManager {
     /// starts with "zz-", so that kanshi, which applies the first profile
     /// that matches in file name order, prefers a profile saved for the
     /// monitors by their descriptions.
-    fn kanshi_profile(&self, config: &[MonitorApply]) -> (String, Vec<u8>) {
+    ///
+    /// kanshi cannot mirror outputs. A monitor that mirrors another one is
+    /// enabled in its logical monitor's place, with its own mode and scale,
+    /// and recorded in a comment (see [`MIRROR_OUTPUT`]). On a sway that can
+    /// mirror outputs, the profile runs `regolith-displayd --restore-mirrors`,
+    /// which mirrors exactly the recorded outputs, so that a mirror kept for
+    /// other monitors on the same connectors doesn't linger. `outputs` are
+    /// sway's outputs before the change, which tell whether it can mirror and
+    /// give the scale of the mirrors, and the rotation of those kept as they
+    /// are.
+    fn kanshi_profile(&self, config: &[MonitorApply], outputs: &[SwayOutput]) -> (String, Vec<u8>) {
         let (profile_name, pinned) = self.kanshi_profile_name();
 
         let mut profile_buf = Vec::new();
+        let mut body = Vec::new();
         let mut active_physical_monitors = Vec::new();
 
         for (connector, description) in &pinned {
@@ -427,7 +477,6 @@ impl DisplayManager {
             )
             .unwrap();
         }
-        writeln!(&mut profile_buf, "profile {{").unwrap();
         for mutter_logical_mointor in config {
             let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&self.monitors)
             else {
@@ -435,12 +484,39 @@ impl DisplayManager {
             };
 
             active_physical_monitors.push(sway_physical_monitor.clone());
-            mutter_logical_mointor.save_kanshi(
-                &mut profile_buf,
-                sway_physical_monitor,
-                &self.monitors,
-            );
+            mutter_logical_mointor.save_kanshi(&mut body, sway_physical_monitor, &self.monitors);
+
+            let restated = mutter_logical_mointor.restates(&self.monitors, &self.logical_monitors);
+            let (x, y) = mutter_logical_mointor.position();
+            let source = sway_physical_monitor.kanshi_name(&self.monitors);
+            for (copy, mode) in mutter_logical_mointor.copies(&self.monitors) {
+                let name = copy.kanshi_name(&self.monitors);
+                let current = outputs.iter().find(|o| o.output.name == copy.connector());
+                let transform = match current {
+                    Some(current) if restated => {
+                        MonitorTransform::from_sway(&current.output.transform)
+                    }
+                    _ => mutter_logical_mointor.transform(),
+                };
+                let mut line = format!(
+                    "\toutput \"{name}\" mode {} position {x},{y} transform {}",
+                    mode.get_modestr(),
+                    transform.to_kanshi()
+                );
+                if let Some(scale) = current.and_then(|current| current.output.scale) {
+                    line.push_str(&format!(" scale {scale}"));
+                }
+                writeln!(&mut body, "{line} enable").unwrap();
+                writeln!(
+                    &mut profile_buf,
+                    "{MIRROR_OUTPUT} \"{name}\" of \"{source}\""
+                )
+                .unwrap();
+                active_physical_monitors.push(copy.clone());
+            }
         }
+        writeln!(&mut profile_buf, "profile {{").unwrap();
+        profile_buf.append(&mut body);
 
         for disabled_mon in self.get_disabled_monitors(&active_physical_monitors) {
             writeln!(
@@ -449,6 +525,18 @@ impl DisplayManager {
                 disabled_mon.kanshi_name(&self.monitors)
             )
             .expect("Failed to write to file");
+        }
+        if mirror::can_mirror(outputs) {
+            // Also without mirrors: sway keeps a mirror setting until it is
+            // turned off, which kanshi cannot do. The binary is named, found
+            // on PATH like kanshi itself: a path to the running binary may
+            // not survive an upgrade.
+            writeln!(
+                &mut profile_buf,
+                "\texec regolith-displayd {}",
+                mirror::RESTORE_ARG
+            )
+            .unwrap();
         }
         writeln!(&mut profile_buf, "}}").unwrap();
         (profile_name, profile_buf)
@@ -550,25 +638,92 @@ impl DisplayManager {
         }
     }
 
-    /// The sway commands that apply `config`: the outputs it names are
-    /// enabled, and the others disabled after them, so that some output stays
-    /// on all along.
-    fn sway_commands(&self, config: &[MonitorApply]) -> Vec<String> {
-        let mut commands = Vec::new();
+    /// The sway commands that apply `config` to sway's `outputs` (see
+    /// [`ordered_commands`]): the first monitor of each logical monitor shows
+    /// it, the others mirror that monitor in their own mode, with the logical
+    /// monitor's rotation, and the monitors left out are disabled.
+    ///
+    /// The monitors that mirror a logical monitor applied exactly as it is
+    /// reported keep their rotation, which may have been set outside
+    /// Settings. A mirror's scale is always its own.
+    fn sway_commands(&self, config: &[MonitorApply], outputs: &[SwayOutput]) -> Vec<String> {
+        let mut targets = Vec::new();
         let mut active = Vec::new();
         for mutter_logical_mointor in config {
             let Some(monitor) = mutter_logical_mointor.search_monitor(&self.monitors) else {
                 continue;
             };
-            if let Some(command) = mutter_logical_mointor.sway_command(monitor) {
-                commands.push(command);
-                active.push(monitor.clone());
+            let Some(settings) = mutter_logical_mointor.sway_settings(monitor) else {
+                continue;
+            };
+            targets.push(OutputTarget::shown(monitor.connector(), settings));
+            active.push(monitor.clone());
+            let restated = mutter_logical_mointor.restates(&self.monitors, &self.logical_monitors);
+            for (copy, mode) in mutter_logical_mointor.copies(&self.monitors) {
+                let mut settings = format!("mode {}", mode.sway_mode());
+                if !restated {
+                    settings.push_str(" transform ");
+                    settings.push_str(mutter_logical_mointor.transform().to_sway());
+                }
+                targets.push(OutputTarget::mirroring(
+                    copy.connector(),
+                    settings,
+                    monitor.connector(),
+                ));
+                active.push(copy.clone());
             }
         }
         for disabled in self.get_disabled_monitors(&active) {
-            commands.push(format!("output \"{}\" disable", disabled.connector()));
+            targets.push(OutputTarget::disabled(disabled.connector()));
         }
-        commands
+        ordered_commands(&targets, outputs)
+    }
+
+    /// Put first, in each logical monitor of `config` shown on several
+    /// monitors, the one that is to show it while the others mirror it.
+    ///
+    /// The Displays panel keeps a logical monitor's monitors in a hash table
+    /// and sends them in no particular order, so their order says little. The
+    /// monitor that already shows this state's logical monitor to another
+    /// monitor of the group stays the one shown; else the one whose logical
+    /// monitor is primary in this state; else the first one listed.
+    fn order_mirrors(&self, config: &mut [MonitorApply]) {
+        for logical in config
+            .iter_mut()
+            .filter(|logical| logical.monitors.len() > 1)
+        {
+            let named = |connector: &str| logical.monitors.iter().any(|m| m.0 == connector);
+            let shown = self.logical_monitors.iter().find(|current| {
+                named(current.connector()) && current.connectors().skip(1).any(named)
+            });
+            let primary = self
+                .logical_monitors
+                .iter()
+                .find(|current| current.is_primary() && named(current.connector()));
+            if let Some(source) = shown.or(primary).map(|c| c.connector().to_string()) {
+                logical.put_first(&source);
+            }
+        }
+    }
+
+    /// Whether `config` repeats this state exactly, as GetCurrentState
+    /// reports it (see [`DisplayServer::reported`]): each logical monitor
+    /// named once, with the same monitors mirroring the same one, each in its
+    /// current mode, in the same place, scale and rotation (see
+    /// [`MonitorApply::restates`]), and the same primary.
+    fn restates_state(&self, config: &[MonitorApply]) -> bool {
+        if config.is_empty() || config.len() != self.logical_monitors.len() {
+            return false;
+        }
+        let mut named = HashSet::new();
+        config.iter().all(|logical| {
+            !logical.monitors.is_empty()
+                && named.insert(logical.connector())
+                && logical.restates(&self.monitors, &self.logical_monitors)
+                && logical
+                    .search_logical_monitor(&self.logical_monitors)
+                    .is_some_and(|current| current.is_primary() == logical.is_primary())
+        })
     }
 
     /// Get list of all the monitors that are not active
@@ -842,8 +997,10 @@ fn verify_layout(config: &[MonitorApply], monitors: &[Monitor]) -> zbus::fdo::Re
     }
     let mut seen = HashSet::new();
     for logical in config {
-        if !seen.insert(logical.connector()) {
-            return invalid("A monitor is assigned twice");
+        for (connector, _, _) in &logical.monitors {
+            if !seen.insert(connector.as_str()) {
+                return invalid("A monitor is assigned twice");
+            }
         }
     }
     let rects: Vec<(i32, i32, i32, i32)> = config
@@ -1338,7 +1495,7 @@ mod tests {
             logical_monitors: Vec::new(),
             properties: DisplayManagerProperties::new(),
         };
-        let (name, contents) = manager.kanshi_profile(config);
+        let (name, contents) = manager.kanshi_profile(config, &[]);
         (name, String::from_utf8(contents).unwrap())
     }
 
@@ -2414,7 +2571,7 @@ impl Confirmation {
             }
         } else {
             info!("Configuration not kept: reverting");
-            if let Err(e) = run_sway(&self.sway_connection, &self.previous).await {
+            if let Err(e) = restore_outputs(&self.sway_connection, &self.previous).await {
                 error!("Error reverting the configuration: {e}");
             }
             *self.primary.lock().await = self.previous_primary;
@@ -2460,47 +2617,149 @@ fn spawn_prompt(output: &str, deadline: Instant) -> Option<tokio::process::Child
     }
 }
 
-/// The sway commands that bring the outputs back to how they are now.
-async fn current_sway_commands(sway: &Mutex<Connection>) -> Result<Vec<String>, Box<dyn Error>> {
-    let outputs = sway.lock().await.get_outputs().await?;
-    Ok(restore_commands(&outputs))
+/// How an output is to be set: enabled with the settings of sway's `output`
+/// command, showing its own part of the layout or mirroring another output,
+/// or disabled.
+#[derive(Debug, PartialEq)]
+struct OutputTarget {
+    name: String,
+    /// What follows `output <name> enable`, or None to disable the output.
+    settings: Option<String>,
+    /// The output it mirrors.
+    mirror: Option<String>,
 }
 
-/// The sway commands that bring `outputs` back: the active ones first, with
-/// their mode, position, scale and transform as sway reports them, then the
+impl OutputTarget {
+    fn shown(name: &str, settings: String) -> OutputTarget {
+        OutputTarget {
+            name: name.to_string(),
+            settings: Some(settings),
+            mirror: None,
+        }
+    }
+
+    fn mirroring(name: &str, settings: String, source: &str) -> OutputTarget {
+        OutputTarget {
+            name: name.to_string(),
+            settings: Some(settings),
+            mirror: Some(source.to_string()),
+        }
+    }
+
+    fn disabled(name: &str) -> OutputTarget {
+        OutputTarget {
+            name: name.to_string(),
+            settings: None,
+            mirror: None,
+        }
+    }
+}
+
+/// The sway commands that set the outputs to `targets`, given sway's
+/// `outputs` as they are when the commands run.
+///
+/// The outputs that show their own part of the layout are enabled first,
+/// and the disabled ones come after them, so that some output stays on all
+/// along. sway refuses a chain of mirrors, so the outputs that mirror come
+/// last, and an output that is to mirror another source than now stops
+/// mirroring first: some other output may be about to mirror the one it
+/// mirrors now. A sway that cannot mirror outputs gets only the commands it
+/// knows.
+fn ordered_commands(targets: &[OutputTarget], outputs: &[SwayOutput]) -> Vec<String> {
+    let off = if mirror::can_mirror(outputs) {
+        " mirror off"
+    } else {
+        ""
+    };
+    let mut commands = Vec::new();
+    for target in targets {
+        let Some(source) = &target.mirror else {
+            continue;
+        };
+        let mirrors_now = outputs
+            .iter()
+            .find(|o| o.output.name == target.name)
+            .and_then(|o| o.mirror.as_deref());
+        if mirrors_now.is_some_and(|now| now != source) {
+            commands.push(format!("output \"{}\" mirror off", target.name));
+        }
+    }
+    for target in targets.iter().filter(|t| t.mirror.is_none()) {
+        if let Some(settings) = &target.settings {
+            commands.push(format!("output \"{}\" enable {settings}{off}", target.name));
+        }
+    }
+    for target in targets.iter().filter(|t| t.settings.is_none()) {
+        commands.push(format!("output \"{}\"{off} disable", target.name));
+    }
+    for target in targets {
+        if let (Some(settings), Some(source)) = (&target.settings, &target.mirror) {
+            commands.push(format!(
+                "output \"{}\" enable {settings} mirror \"{source}\"",
+                target.name
+            ));
+        }
+    }
+    commands
+}
+
+/// The current mode of `output`, as sway's `output ... mode` command takes it.
+fn sway_mode(output: &Output) -> Option<String> {
+    let mode = output.current_mode.as_ref()?;
+    Some(if mode.refresh > 0 {
+        format!(
+            "{}x{}@{}Hz",
+            mode.width,
+            mode.height,
+            mode.refresh as f64 / 1000.0
+        )
+    } else {
+        format!("{}x{}", mode.width, mode.height)
+    })
+}
+
+/// The sway commands that bring the outputs back to `previous`, as sway
+/// reported them, from `current`: the active ones with their mode,
+/// position, scale and transform, those that mirrored another output
+/// mirroring it again, with their own mode, scale and transform, and the
 /// others disabled.
-fn restore_commands(outputs: &[Output]) -> Vec<String> {
-    let mut enable = Vec::new();
-    let mut disable = Vec::new();
-    for output in outputs {
+fn restore_commands(previous: &[SwayOutput], current: &[SwayOutput]) -> Vec<String> {
+    let mut targets = Vec::new();
+    for sway_output in previous {
+        let output = &sway_output.output;
         if !output.active {
-            disable.push(format!("output \"{}\" disable", output.name));
+            targets.push(OutputTarget::disabled(&output.name));
             continue;
         }
-        let mut command = format!("output \"{}\" enable", output.name);
-        if let Some(mode) = &output.current_mode {
-            if mode.refresh > 0 {
-                command.push_str(&format!(
-                    " mode {}x{}@{}Hz",
-                    mode.width,
-                    mode.height,
-                    mode.refresh as f64 / 1000.0
-                ));
-            } else {
-                command.push_str(&format!(" mode {}x{}", mode.width, mode.height));
-            }
+        let mut settings = Vec::new();
+        if let Some(mode) = sway_mode(output) {
+            settings.push(format!("mode {mode}"));
         }
-        command.push_str(&format!(
-            " position {} {} scale {} transform {}",
-            output.rect.x,
-            output.rect.y,
+        let source = sway_output.source(previous);
+        if source.is_none() {
+            settings.push(format!("position {} {}", output.rect.x, output.rect.y));
+        }
+        settings.push(format!(
+            "scale {} transform {}",
             output.scale.unwrap_or(1.0),
             output.transform.as_deref().unwrap_or("normal")
         ));
-        enable.push(command);
+        let settings = settings.join(" ");
+        targets.push(match source {
+            Some(source) => OutputTarget::mirroring(&output.name, settings, source),
+            None => OutputTarget::shown(&output.name, settings),
+        });
     }
-    enable.extend(disable);
-    enable
+    ordered_commands(&targets, current)
+}
+
+/// Bring the outputs back to `previous`, as sway reported them.
+async fn restore_outputs(sway: &Mutex<Connection>, previous: &[SwayOutput]) -> Result<(), String> {
+    let current = {
+        let _sway = sway.lock().await;
+        mirror::get_outputs().await.map_err(|e| e.to_string())?
+    };
+    run_sway(sway, &restore_commands(previous, &current)).await
 }
 
 /// Run `commands` in sway, in order, as one IPC request.
@@ -2522,21 +2781,55 @@ async fn run_sway(sway: &Mutex<Connection>, commands: &[String]) -> Result<(), S
     Ok(())
 }
 
-/// The output to show the prompt on: the focused one if it is on, else the
-/// first output that is on.
-async fn prompt_output(sway: &Mutex<Connection>) -> String {
-    let outputs = match sway.lock().await.get_outputs().await {
-        Ok(outputs) => outputs,
-        Err(e) => {
-            error!("Error getting outputs from sway: {e}");
-            return String::new();
+/// The output to show the prompt on, once a change has been applied to the
+/// outputs that were `before`: the one that had the focus before the change
+/// if it is still on, else the focused one, else the first output that is
+/// on. An output that mirrors another one has no surfaces of its own, so the
+/// prompt goes on the output it mirrors: the focused output may have just
+/// become a mirror.
+async fn prompt_output(sway: &Mutex<Connection>, before: &[SwayOutput]) -> String {
+    let outputs = {
+        let _sway = sway.lock().await;
+        match mirror::get_outputs().await {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                error!("Error getting outputs from sway: {e}");
+                return String::new();
+            }
         }
     };
-    let active = || outputs.iter().filter(|o| o.active);
-    active()
-        .find(|o| o.focused)
-        .or_else(|| active().next())
-        .map(|o| o.name.clone())
+    prompt_output_of(before, &outputs)
+}
+
+/// [`prompt_output`] for sway's outputs `before` and `after` the change.
+fn prompt_output_of(before: &[SwayOutput], after: &[SwayOutput]) -> String {
+    // The output that shows `name`: itself, or the output it mirrors.
+    let showing = |name: &str| {
+        let output = after
+            .iter()
+            .find(|o| o.output.name == name && o.output.active)?;
+        Some(
+            output
+                .source(after)
+                .unwrap_or(&output.output.name)
+                .to_string(),
+        )
+    };
+    let focused = |outputs: &[SwayOutput]| {
+        outputs
+            .iter()
+            .find(|o| o.output.active && o.output.focused)
+            .map(|o| o.output.name.clone())
+    };
+    focused(before)
+        .and_then(|name| showing(&name))
+        .or_else(|| focused(after).and_then(|name| showing(&name)))
+        .or_else(|| {
+            after
+                .iter()
+                .find(|o| o.output.active && o.source(after).is_none())
+                .map(|o| o.output.name.clone())
+        })
         .unwrap_or_default()
 }
 
@@ -2565,24 +2858,98 @@ async fn save_profile(
 mod confirm_tests {
     use super::*;
 
-    fn outputs() -> Vec<Output> {
-        serde_json::from_str(
-            r#"[{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
-                 "serial": "Unknown", "active": true, "dpms": true, "primary": false,
-                 "scale": 2.0, "transform": "90", "modes": [],
-                 "current_mode": {"width": 1024, "height": 768, "refresh": 60000},
-                 "rect": {"x": 80, "y": 120, "width": 384, "height": 512}},
-                {"id": 4, "name": "HEADLESS-2", "make": "Unknown", "model": "Unknown",
-                 "serial": "Unknown", "active": false, "dpms": false, "primary": false,
-                 "modes": [], "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}]"#,
+    /// Outputs from a sway that cannot mirror outputs.
+    fn outputs() -> Vec<SwayOutput> {
+        mirror::parse_outputs(
+            serde_json::from_str(
+                r#"[{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
+                     "serial": "Unknown", "active": true, "dpms": true, "primary": false,
+                     "scale": 2.0, "transform": "90", "modes": [],
+                     "current_mode": {"width": 1024, "height": 768, "refresh": 60000},
+                     "rect": {"x": 80, "y": 120, "width": 384, "height": 512}},
+                    {"id": 4, "name": "HEADLESS-2", "make": "Unknown", "model": "Unknown",
+                     "serial": "Unknown", "active": false, "dpms": false, "primary": false,
+                     "modes": [], "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}]"#,
+            )
+            .unwrap(),
         )
         .unwrap()
+    }
+
+    /// An output from a sway that mirrors: `name`, active at `x` in mode
+    /// `width`x`height`, rotated by `transform`, mirroring `mirror` if given.
+    fn output(
+        name: &str,
+        x: i32,
+        (width, height): (i32, i32),
+        transform: &str,
+        mirror: Option<&str>,
+    ) -> serde_json::Value {
+        let (w, h) = if transform == "90" {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        serde_json::json!({
+            "id": 3, "name": name, "make": "Unknown", "model": "Unknown",
+            "serial": "Unknown", "active": true, "dpms": true, "primary": false,
+            "scale": 1.0, "transform": transform, "modes": [], "mirror": mirror,
+            "current_mode": {"width": width, "height": height, "refresh": 60000},
+            "rect": {"x": x, "y": 0, "width": w, "height": h}
+        })
+    }
+
+    /// HEADLESS-1 at (1024, 0), rotated, mirrored by HEADLESS-3, whose own
+    /// mode is 1280x720 and whose own rotation is normal, and HEADLESS-2 at
+    /// (0, 0). sway gives a mirror its source's rectangle.
+    fn outputs_with_mirror() -> Vec<SwayOutput> {
+        let mut copy = output(
+            "HEADLESS-3",
+            1024,
+            (1280, 720),
+            "normal",
+            Some("HEADLESS-1"),
+        );
+        copy["rect"] = serde_json::json!({"x": 1024, "y": 0, "width": 768, "height": 1024});
+        mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 1024, (1024, 768), "90", None),
+            output("HEADLESS-2", 0, (1024, 768), "normal", None),
+            copy,
+        ]))
+    }
+
+    fn manager_of(outputs: &[SwayOutput]) -> DisplayManager {
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(outputs);
+        let mut manager = DisplayManager {
+            serial: 0,
+            monitors,
+            logical_monitors,
+            properties: DisplayManagerProperties::new(),
+        };
+        manager.mark_primary(None);
+        manager
+    }
+
+    fn config(json: &str) -> Vec<MonitorApply> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Whether every logical monitor of `config` passes
+    /// [`MonitorApply::verify`] for `manager`, with a sway that can mirror.
+    fn verified(manager: &DisplayManager, config: &[MonitorApply]) -> Result<(), String> {
+        config
+            .iter()
+            .try_for_each(|logical| {
+                logical.verify(&manager.monitors, &manager.logical_monitors, true)
+            })
+            .and_then(|()| verify_layout(config, &manager.monitors))
+            .map_err(|e| e.to_string())
     }
 
     #[test]
     fn restore_commands_replay_the_outputs_as_sway_reports_them() {
         assert_eq!(
-            restore_commands(&outputs()),
+            restore_commands(&outputs(), &outputs()),
             [
                 "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 80 120 scale 2 transform 90",
                 "output \"HEADLESS-2\" disable",
@@ -2592,25 +2959,344 @@ mod confirm_tests {
 
     #[test]
     fn sway_commands_disable_the_outputs_left_out() {
-        let outputs: Vec<SwayOutput> = outputs().into_iter().map(SwayOutput::from).collect();
-        let (monitors, _) = DisplayManager::monitors_of(&outputs);
-        let manager = DisplayManager {
-            serial: 0,
-            monitors,
-            logical_monitors: Vec::new(),
-            properties: DisplayManagerProperties::new(),
-        };
-        let config: Vec<MonitorApply> = serde_json::from_str(
+        let outputs = outputs();
+        let manager = manager_of(&outputs);
+        let config = config(
             r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 3, "primary": false,
                  "monitors": [["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
-        )
-        .unwrap();
+        );
         assert_eq!(
-            manager.sway_commands(&config),
+            manager.sway_commands(&config, &outputs),
             [
                 "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 0 0 scale 1 transform 270",
                 "output \"HEADLESS-2\" disable",
             ]
         );
+    }
+
+    #[test]
+    fn sway_commands_mirror_once_the_sources_are_set() {
+        let outputs = outputs_with_mirror();
+        let manager = manager_of(&outputs);
+        // HEADLESS-2 rotated and mirrored by HEADLESS-1; HEADLESS-3 off.
+        let config = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 1, "primary": true,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}],
+                              ["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
+        );
+        assert_eq!(verified(&manager, &config), Ok(()));
+        assert_eq!(
+            manager.sway_commands(&config, &outputs),
+            [
+                "output \"HEADLESS-2\" enable mode 1024x768@60Hz position 0 0 scale 1 transform 90 mirror off",
+                "output \"HEADLESS-3\" mirror off disable",
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz transform 90 mirror \"HEADLESS-2\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mirror_that_changes_source_stops_mirroring_first() {
+        let outputs = outputs_with_mirror();
+        let manager = manager_of(&outputs);
+        // HEADLESS-3 mirrors HEADLESS-1 now; HEADLESS-1 and HEADLESS-3 are both
+        // to mirror HEADLESS-2, which sway only lets HEADLESS-1 do once
+        // HEADLESS-3 no longer mirrors it.
+        let config = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}],
+                              ["HEADLESS-1", "1024x768@60Hz", {}],
+                              ["HEADLESS-3", "1280x720@60Hz", {}]]}]"#,
+        );
+        assert_eq!(
+            manager.sway_commands(&config, &outputs),
+            [
+                "output \"HEADLESS-3\" mirror off",
+                "output \"HEADLESS-2\" enable mode 1024x768@60Hz position 0 0 scale 1 transform normal mirror off",
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz transform normal mirror \"HEADLESS-2\"",
+                "output \"HEADLESS-3\" enable mode 1280x720@60Hz transform normal mirror \"HEADLESS-2\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_commands_bring_mirroring_back() {
+        let previous = outputs_with_mirror();
+        // Since then, HEADLESS-3 shows itself, mirrored by HEADLESS-1, and
+        // HEADLESS-2 is off.
+        let mut off = output("HEADLESS-2", 0, (1024, 768), "normal", None);
+        off["active"] = serde_json::json!(false);
+        let current = mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 0, (1280, 720), "normal", Some("HEADLESS-3")),
+            off,
+            output("HEADLESS-3", 0, (1280, 720), "normal", None),
+        ]));
+        assert_eq!(
+            restore_commands(&previous, &current),
+            [
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 1024 0 scale 1 transform 90 mirror off",
+                "output \"HEADLESS-2\" enable mode 1024x768@60Hz position 0 0 scale 1 transform normal mirror off",
+                "output \"HEADLESS-3\" enable mode 1280x720@60Hz scale 1 transform normal mirror \"HEADLESS-1\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn mirrored_monitors_must_show_modes_of_the_same_size() {
+        let outputs = outputs_with_mirror();
+        let manager = manager_of(&outputs);
+        // HEADLESS-2 at 1024x768 mirrored by HEADLESS-3 at 1280x720.
+        let new_pair = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}],
+                              ["HEADLESS-3", "1280x720@60Hz", {}]]}]"#,
+        );
+        assert!(verified(&manager, &new_pair)
+            .unwrap_err()
+            .contains("not of the same size"));
+        // HEADLESS-3 already mirrors HEADLESS-1 in its own mode: the pair may
+        // move, here to the left of HEADLESS-2.
+        let moved = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 1, "primary": true,
+                 "monitors": [["HEADLESS-1", "1024x768@60Hz", {}],
+                              ["HEADLESS-3", "1280x720@60Hz", {}]]},
+                {"x_pos": 768, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": false,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}]]}]"#,
+        );
+        assert_eq!(verified(&manager, &moved), Ok(()));
+        // It may not switch to another mode of another size, though.
+        let mut copy = output(
+            "HEADLESS-3",
+            1024,
+            (1280, 720),
+            "normal",
+            Some("HEADLESS-1"),
+        );
+        copy["modes"] = serde_json::json!([
+            {"width": 1280, "height": 720, "refresh": 60000},
+            {"width": 800, "height": 600, "refresh": 60000}
+        ]);
+        copy["rect"] = serde_json::json!({"x": 1024, "y": 0, "width": 768, "height": 1024});
+        let resizable = manager_of(&mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 1024, (1024, 768), "90", None),
+            output("HEADLESS-2", 0, (1024, 768), "normal", None),
+            copy,
+        ])));
+        assert_eq!(verified(&resizable, &moved), Ok(()));
+        let resized = config(
+            &serde_json::to_string(&moved)
+                .unwrap()
+                .replace("1280x720@60Hz", "800x600@60Hz"),
+        );
+        assert!(verified(&resizable, &resized)
+            .unwrap_err()
+            .contains("not of the same size"));
+        // A monitor in two logical monitors, or twice in one.
+        for twice in [
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}],
+                              ["HEADLESS-1", "1024x768@60Hz", {}]]},
+                {"x_pos": 1024, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": false,
+                 "monitors": [["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}],
+                              ["HEADLESS-2", "1024x768@60Hz", {}]]}]"#,
+        ] {
+            assert!(verified(&manager, &config(twice))
+                .unwrap_err()
+                .contains("assigned twice"));
+        }
+    }
+
+    #[test]
+    fn a_restated_logical_monitor_keeps_its_mirrors_as_they_are() {
+        let outputs = outputs_with_mirror();
+        let manager = manager_of(&outputs);
+        let config = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": false,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}]]},
+                {"x_pos": 1024, "y_pos": 0, "scale": 1.0, "transform": 1, "primary": true,
+                 "monitors": [["HEADLESS-1", "1024x768@60Hz", {}],
+                              ["HEADLESS-3", "1280x720@60Hz", {}]]}]"#,
+        );
+        assert!(config[1].restates(&manager.monitors, &manager.logical_monitors));
+        // HEADLESS-3 keeps its own rotation.
+        assert_eq!(
+            manager.sway_commands(&config, &outputs),
+            [
+                "output \"HEADLESS-2\" enable mode 1024x768@60Hz position 0 0 scale 1 transform normal mirror off",
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 1024 0 scale 1 transform 90 mirror off",
+                "output \"HEADLESS-3\" enable mode 1280x720@60Hz mirror \"HEADLESS-1\"",
+            ]
+        );
+        // Every headless output reports the same description, so the
+        // profile names them by connector.
+        let (_, profile) = manager.kanshi_profile(&config, &outputs);
+        let profile = String::from_utf8(profile).unwrap();
+        assert!(
+            profile.contains(
+                "\n# regolith-displayd: mirror \"HEADLESS-3\" of \"HEADLESS-1\"\nprofile {\n"
+            ),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(
+                "\n\toutput \"HEADLESS-3\" mode 1280x720@60Hz position 1024,0 transform normal scale 1 enable\n"
+            ),
+            "{profile}"
+        );
+        assert!(
+            profile.ends_with("\n\texec regolith-displayd --restore-mirrors\n}\n"),
+            "{profile}"
+        );
+        assert_eq!(duplicate_output(&profile), None);
+        assert_eq!(
+            mirrored_outputs(&profile),
+            [("HEADLESS-3".to_string(), "HEADLESS-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_profile_ends_mirroring_only_where_sway_can_mirror() {
+        let config = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                 "monitors": [["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
+        );
+        // Without mirrors, the helper still runs: it ends a mirror that sway
+        // kept for the same connectors, which kanshi cannot do.
+        let outputs = outputs_with_mirror();
+        let (_, profile) = manager_of(&outputs).kanshi_profile(&config, &outputs);
+        let profile = String::from_utf8(profile).unwrap();
+        assert!(
+            !profile.contains("# regolith-displayd: mirror"),
+            "{profile}"
+        );
+        assert!(
+            profile.ends_with("\n\texec regolith-displayd --restore-mirrors\n}\n"),
+            "{profile}"
+        );
+        // A sway that cannot mirror gets the profile it got before.
+        let outputs = self::outputs();
+        let (_, profile) = manager_of(&outputs).kanshi_profile(&config, &outputs);
+        let profile = String::from_utf8(profile).unwrap();
+        assert!(!profile.contains("mirror"), "{profile}");
+        assert!(!profile.contains("exec"), "{profile}");
+    }
+
+    #[test]
+    fn the_monitor_already_shown_stays_shown_whatever_the_order() {
+        // The Displays panel lists HEADLESS-3 before HEADLESS-1, which
+        // HEADLESS-3 mirrors: an exact repeat all the same.
+        let outputs = outputs_with_mirror();
+        let manager = manager_of(&outputs);
+        let mut config = config(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": false,
+                 "monitors": [["HEADLESS-2", "1024x768@60Hz", {}]]},
+                {"x_pos": 1024, "y_pos": 0, "scale": 1.0, "transform": 1, "primary": true,
+                 "monitors": [["HEADLESS-3", "1280x720@60Hz", {}],
+                              ["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
+        );
+        manager.order_mirrors(&mut config);
+        assert_eq!(config[1].connector(), "HEADLESS-1");
+        assert!(manager.restates_state(&config));
+    }
+
+    #[test]
+    fn a_new_mirror_shows_the_primary_monitor() {
+        // Side by side, HEADLESS-2 primary; Mirror lists HEADLESS-1 first.
+        let outputs = mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 0, (1024, 768), "normal", None),
+            output("HEADLESS-2", 1024, (1024, 768), "normal", None),
+            output("HEADLESS-3", 2048, (1024, 768), "normal", None),
+        ]));
+        let mut manager = manager_of(&outputs);
+        manager.mark_primary(Some("HEADLESS-2"));
+        let pair = r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": true,
+                        "monitors": [["HEADLESS-1", "1024x768@60Hz", {}],
+                                     ["HEADLESS-2", "1024x768@60Hz", {}]]}]"#;
+        let mut config = config(pair);
+        manager.order_mirrors(&mut config);
+        assert_eq!(config[0].connector(), "HEADLESS-2");
+        assert_eq!(
+            manager.sway_commands(&config, &outputs),
+            [
+                "output \"HEADLESS-2\" enable mode 1024x768@60Hz position 0 0 scale 1 transform normal mirror off",
+                "output \"HEADLESS-3\" mirror off disable",
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz transform normal mirror \"HEADLESS-2\"",
+            ]
+        );
+        // The primary not among them: the first one listed.
+        manager.mark_primary(Some("HEADLESS-3"));
+        let mut config = self::config(pair);
+        manager.order_mirrors(&mut config);
+        assert_eq!(config[0].connector(), "HEADLESS-1");
+    }
+
+    #[test]
+    fn an_exact_repeat_skips_the_new_layout_rules() {
+        // HEADLESS-1, 800x600, mirrors HEADLESS-2, 1024x768, from the
+        // configuration or swaymsg: a pair Settings could not ask for.
+        let mut copy = output("HEADLESS-1", 1024, (800, 600), "normal", Some("HEADLESS-2"));
+        copy["rect"] = serde_json::json!({"x": 1024, "y": 0, "width": 1024, "height": 768});
+        let outputs = mirror::tests::from_reply(serde_json::json!([
+            copy,
+            output("HEADLESS-2", 1024, (1024, 768), "normal", None),
+        ]));
+        let manager = manager_of(&outputs);
+        let config = |x: i32, primary: bool, monitors: &str| {
+            self::config(&format!(
+                r#"[{{"x_pos": {x}, "y_pos": 0, "scale": 1.0, "transform": 0,
+                     "primary": {primary}, "monitors": [{monitors}]}}]"#
+            ))
+        };
+        let pair = r#"["HEADLESS-2", "1024x768@60Hz", {}], ["HEADLESS-1", "800x600@60Hz", {}]"#;
+        let repeat = config(1024, true, pair);
+        assert!(verify_layout(&repeat, &manager.monitors).is_err());
+        assert!(manager.restates_state(&repeat));
+        // Anything else is a new layout.
+        assert!(!manager.restates_state(&config(0, true, pair)));
+        assert!(!manager.restates_state(&config(1024, false, pair)));
+        assert!(!manager.restates_state(&config(
+            1024,
+            true,
+            r#"["HEADLESS-2", "1024x768@60Hz", {}]"#
+        )));
+        assert!(!manager.restates_state(&config(
+            1024,
+            true,
+            r#"["HEADLESS-1", "800x600@60Hz", {}], ["HEADLESS-2", "1024x768@60Hz", {}]"#
+        )));
+        let mut twice = repeat.clone();
+        twice.extend(repeat.clone());
+        assert!(!manager.restates_state(&twice));
+        assert!(!manager.restates_state(&[]));
+        assert!(!manager.restates_state(&config(1024, true, "")));
+    }
+
+    #[test]
+    fn the_prompt_goes_where_the_focus_was_or_its_source() {
+        let focused = |name: &str, x, mirror| {
+            let mut output = output(name, x, (1024, 768), "normal", mirror);
+            output["focused"] = serde_json::json!(true);
+            output
+        };
+        let before = mirror::tests::from_reply(serde_json::json!([
+            focused("HEADLESS-1", 0, None),
+            output("HEADLESS-2", 1024, (1024, 768), "normal", None),
+        ]));
+        // HEADLESS-1, which had the focus, now mirrors HEADLESS-2, and sway
+        // moved the focus there.
+        let after = mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 0, (1024, 768), "normal", Some("HEADLESS-2")),
+            focused("HEADLESS-2", 0, None),
+        ]));
+        assert_eq!(prompt_output_of(&before, &after), "HEADLESS-2");
+        // No focus before: the focused output now.
+        let unfocused = mirror::tests::from_reply(serde_json::json!([
+            output("HEADLESS-1", 0, (1024, 768), "normal", None),
+            output("HEADLESS-2", 1024, (1024, 768), "normal", None),
+        ]));
+        assert_eq!(prompt_output_of(&unfocused, &before), "HEADLESS-1");
+        assert_eq!(prompt_output_of(&outputs(), &outputs()), "HEADLESS-1");
     }
 }

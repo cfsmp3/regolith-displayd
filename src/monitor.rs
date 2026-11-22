@@ -6,9 +6,7 @@ use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 use std::io::Write;
-use std::sync::Arc;
-use swayipc_async::{Connection, Output};
-use tokio::sync::Mutex;
+use swayipc_async::Output;
 use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
@@ -426,6 +424,10 @@ impl LogicalMonitor {
         self.primary = primary;
     }
 
+    pub fn is_primary(&self) -> bool {
+        self.primary
+    }
+
     pub fn get_dpy_name(&self) -> String {
         let desc = &self.monitors[0];
         format!("{} {} {}", desc.1, desc.2, desc.3)
@@ -478,34 +480,98 @@ impl MonitorApply {
     /// The sway command that applies this logical monitor to `monitor`, or
     /// None if `monitor` has no such mode.
     pub fn sway_command(&self, monitor: &Monitor) -> Option<String> {
-        let mode = monitor.search_modes(&self.monitors[0].1)?;
-        let transform =
-            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
         Some(format!(
-            "output \"{}\" enable mode {} position {} {} scale {} transform {}",
+            "output \"{}\" enable {}",
             monitor.connector(),
+            self.sway_settings(monitor)?
+        ))
+    }
+
+    /// What follows `output <name> enable` in [`MonitorApply::sway_command`].
+    pub fn sway_settings(&self, monitor: &Monitor) -> Option<String> {
+        let mode = monitor.search_modes(&self.monitors[0].1)?;
+        Some(format!(
+            "mode {} position {} {} scale {} transform {}",
             mode.sway_mode(),
             self.x_pos,
             self.y_pos,
             self.scale,
-            transform.to_sway()
+            self.transform().to_sway()
         ))
     }
 
+    /// Move the monitor on `connector`, if listed, to the front: the first
+    /// monitor shows the logical monitor, the others mirror it.
+    pub fn put_first(&mut self, connector: &str) {
+        if let Some(i) = self.monitors.iter().position(|m| m.0 == connector) {
+            self.monitors[..=i].rotate_right(1);
+        }
+    }
+
+    /// The monitors that mirror the first one, with the mode asked for each.
+    /// Call it once [`MonitorApply::verify`] has accepted the logical monitor.
+    pub fn copies<'a>(&self, monitors: &'a [Monitor]) -> Vec<(&'a Monitor, &'a Modes)> {
+        self.monitors[1..]
+            .iter()
+            .filter_map(|(connector, mode, _)| {
+                let monitor = monitors.iter().find(|m| m.connector() == connector)?;
+                Some((monitor, monitor.search_modes(mode)?))
+            })
+            .collect()
+    }
+
+    /// Whether the same monitors would mirror the first one as in the
+    /// logical monitor that `logical_monitors` reports for it, or none.
+    pub fn keeps_copies(&self, logical_monitors: &[LogicalMonitor]) -> bool {
+        let Some(current) = self.search_logical_monitor(logical_monitors) else {
+            return false;
+        };
+        let mut asked: Vec<&str> = self.monitors[1..].iter().map(|m| m.0.as_str()).collect();
+        let mut now: Vec<&str> = current.connectors().skip(1).collect();
+        asked.sort_unstable();
+        now.sort_unstable();
+        asked == now
+    }
+
+    /// Whether this logical monitor is exactly the one that
+    /// `logical_monitors` reports: the same monitors mirroring the same one,
+    /// each in its current mode, in the same place, scale and rotation.
+    pub fn restates(&self, monitors: &[Monitor], logical_monitors: &[LogicalMonitor]) -> bool {
+        let Some(current) = self.search_logical_monitor(logical_monitors) else {
+            return false;
+        };
+        self.keeps_copies(logical_monitors)
+            && (current.x_pos, current.y_pos, current.transform)
+                == (self.x_pos, self.y_pos, self.transform)
+            && (current.scale - self.scale).abs() < 1e-6
+            && self.monitors.iter().all(|(connector, mode, _)| {
+                monitors
+                    .iter()
+                    .find(|monitor| monitor.connector() == connector)
+                    .is_some_and(|monitor| monitor.get_current_mode() == mode)
+            })
+    }
+
+    pub fn transform(&self) -> MonitorTransform {
+        MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal)
+    }
+
+    /// Refuse a logical monitor that cannot be applied to `monitors`.
+    /// `can_mirror` tells whether sway can mirror outputs, which a logical
+    /// monitor shown on several monitors needs.
     pub fn verify(
         &self,
-        _sway_connect: &Arc<Mutex<Connection>>,
         monitors: &[Monitor],
         logical_monitors: &[LogicalMonitor],
+        can_mirror: bool,
     ) -> zbus::fdo::Result<()> {
         if self.monitors.is_empty() {
             return Err(ZError::InvalidArgs(String::from(
                 "Logical monitor is empty",
             )));
         }
-        // sway shows each output on its own: it cannot mirror one logical
-        // monitor on several monitors.
-        if self.monitors.len() > 1 {
+        // A sway without output mirroring shows each output on its own.
+        if self.monitors.len() > 1 && !can_mirror {
             return Err(ZError::InvalidArgs(String::from(
                 "Mirroring is not supported",
             )));
@@ -544,6 +610,30 @@ impl MonitorApply {
 
         if MonitorTransform::from_u32(self.transform).is_none() {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
+        }
+
+        // Mirrored monitors show modes of the same size, as in Mutter. A
+        // monitor that already mirrors the first one, which may have been set
+        // up outside Settings, may keep the mode it is in, so that such a
+        // logical monitor can still be moved, or applied back as it is.
+        let keeps_copies = self.keeps_copies(logical_monitors);
+        for (connector, mode_id, _) in &self.monitors[1..] {
+            let copy = monitors
+                .iter()
+                .find(|monitor| monitor.connector() == connector)
+                .ok_or(Failed(String::from("Monitor not found")))?;
+            let copy_mode = copy
+                .search_modes(mode_id)
+                .ok_or(ZError::InvalidArgs(String::from(
+                    "Invalid resolution / refresh rate",
+                )))?;
+            if !(keeps_copies && copy_mode.current())
+                && (copy_mode.width(), copy_mode.height()) != (mode.width(), mode.height())
+            {
+                return Err(ZError::InvalidArgs(String::from(
+                    "Monitor modes in logical monitor not of the same size",
+                )));
+            }
         }
         Ok(())
     }

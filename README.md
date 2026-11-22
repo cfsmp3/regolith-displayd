@@ -25,6 +25,7 @@ Run the daemon with the command specified above. You can then use `gnome-control
 * Refresh Rate
 * Scale
 * Hotplugging monitors
+* Mirroring (needs a sway that mirrors outputs with `output <name> mirror <source>`, such as Regolith's `sway-regolith`)
 * Night Light (needs gnome-settings-daemon's color plugin running in the session and a compositor with `wlr-gamma-control`, such as sway)
 
 # Monitor number labels
@@ -33,7 +34,10 @@ While its window is active, the Displays panel asks the shell to show each monit
 # What doesn't work?
 * ~~Applying **any** changes whatsoever~~
 * ~~Display page doesn't update on monitor change. **Workaround**: switch to some other page from the panel and back or restart `gnome-control-center`~~
-* Screen Mirroring (sway doesn't support it and probably won't for the forseeable future).
+* ~~Screen Mirroring~~
+
+# Mirroring
+Monitors that mirror another one are reported as one logical monitor, the mirrored monitor first, however the mirroring was set up: in Settings, with `swaymsg` or in sway's configuration. In a logical monitor applied from Settings, the first monitor shows the desktop and the others mirror it. kanshi cannot mirror outputs, so a kept profile records the mirrors in `# regolith-displayd: mirror` comments and runs `regolith-displayd --restore-mirrors` once kanshi has applied it.
 
 # Contributing
 Any and all contributions are welcome. Any ideas or suggestions are welcome as well.
