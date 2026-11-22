@@ -6,6 +6,10 @@
 //! swayipc's `Output` has no field for that entry, so the outputs are read
 //! here with it (see [`get_outputs`]). A sway that cannot mirror outputs
 //! reports no such entry at all.
+//!
+//! kanshi cannot mirror outputs. A kept profile records the outputs that
+//! mirror others in comments, and runs `regolith-displayd --restore-mirrors`
+//! (see [`RESTORE_ARG`]) once kanshi has applied it.
 
 use serde_json::Value;
 use std::{error::Error, path::PathBuf};
@@ -15,6 +19,11 @@ use tokio::net::UnixStream;
 
 /// An error that may be held across an await in the daemon's tasks.
 pub type BoxError = Box<dyn Error + Send + Sync>;
+
+/// The argument that runs the binary as the helper that mirrors the outputs,
+/// and only those, as the profile of the connected monitors records it (see
+/// `restore_saved_mirrors`).
+pub const RESTORE_ARG: &str = "--restore-mirrors";
 
 /// A sway output, with the output it mirrors.
 #[derive(Debug)]

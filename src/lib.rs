@@ -499,6 +499,26 @@ impl DisplayManager {
             .map(|monitor| monitor.connector().to_string())
     }
 
+    /// The outputs that mirror another one in the profile of the connected
+    /// monitors, as recorded there (see [`mirrored_outputs`]): the connector
+    /// of each, with that of the output it mirrors.
+    /// None if no profile is saved for them.
+    fn saved_mirrors(&self, paths: &KanshiPaths) -> Option<Vec<(String, String)>> {
+        let (profile_name, _) = self.kanshi_profile_name();
+        let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
+        let connector = |name: &str| {
+            self.monitors
+                .iter()
+                .find(|monitor| monitor.kanshi_name(&self.monitors) == name)
+                .map(|monitor| monitor.connector().to_string())
+        };
+        let mirrors = mirrored_outputs(&profile)
+            .iter()
+            .filter_map(|(copy, source)| Some((connector(copy)?, connector(source)?)))
+            .collect();
+        Some(mirrors)
+    }
+
     /// Mark exactly one logical monitor as primary, as Mutter always does:
     /// the `chosen` monitor if it is on, else the built-in panel, else the
     /// monitor with the largest mode (the first of them on a tie).
@@ -873,6 +893,96 @@ fn verify_layout(config: &[MonitorApply], monitors: &[Monitor]) -> zbus::fdo::Re
         1 => Ok(()),
         _ => invalid("Config contains multiple primary logical monitors"),
     }
+}
+
+/// The comment that records, in a kanshi profile, an output that mirrors
+/// another one: `# regolith-displayd: mirror "<output>" of "<source>"`, with
+/// both named as the profile names them. kanshi cannot mirror outputs, so the
+/// profile also runs `regolith-displayd --restore-mirrors`, which mirrors
+/// them again and ends any other mirroring (see [`restore_saved_mirrors`]).
+const MIRROR_OUTPUT: &str = "# regolith-displayd: mirror";
+
+/// The outputs a profile records as mirroring another one, with that output.
+fn mirrored_outputs(profile: &str) -> Vec<(String, String)> {
+    profile
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix(MIRROR_OUTPUT)?.trim();
+            let (copy, source) = rest.split_once("\" of \"")?;
+            let copy = copy.strip_prefix('"')?;
+            let source = source.strip_suffix('"')?;
+            Some((copy.to_string(), source.to_string()))
+        })
+        .collect()
+}
+
+/// The sway commands that make exactly the outputs in `mirrors` mirror their
+/// source, both given by connector, among sway's `outputs`.
+///
+/// sway keeps an output's mirror setting, by connector, until it is turned
+/// off, and kanshi cannot turn it off: every other output stops mirroring.
+/// So does an output that is to mirror another source than now, first, as
+/// sway refuses a chain of mirrors. An output that already mirrors its
+/// source is left alone.
+fn mirror_commands(mirrors: &[(String, String)], outputs: &[SwayOutput]) -> Vec<String> {
+    let recorded = |name: &str| {
+        mirrors
+            .iter()
+            .find(|(copy, _)| copy == name)
+            .map(|(_, source)| source.as_str())
+    };
+    let mut stop = Vec::new();
+    let mut start = Vec::new();
+    for output in outputs {
+        let name = &output.output.name;
+        let now = output.mirror.as_deref();
+        match recorded(name) {
+            None => stop.push(format!("output \"{name}\" mirror off")),
+            Some(source) if now != Some(source) => {
+                if now.is_some() {
+                    stop.push(format!("output \"{name}\" mirror off"));
+                }
+                start.push(format!("output \"{name}\" mirror \"{source}\""));
+            }
+            Some(_) => {}
+        }
+    }
+    stop.append(&mut start);
+    stop
+}
+
+/// Mirror the outputs as the profile of the connected monitors records it,
+/// and only those, once kanshi has applied that profile: a kept profile
+/// runs this with [`mirror::RESTORE_ARG`]. The profile is found the way the
+/// daemon names it, so no monitor name, which comes from the monitor's EDID,
+/// passes through the shell that kanshi runs the command with.
+pub async fn restore_saved_mirrors() -> Result<(), mirror::BoxError> {
+    let outputs = mirror::get_outputs().await?;
+    let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
+    let manager = DisplayManager {
+        serial: 0,
+        monitors,
+        logical_monitors,
+        properties: DisplayManagerProperties::new(),
+    };
+    let Some(mirrors) = manager.saved_mirrors(&get_kanshi_paths().await?) else {
+        return Err("no profile is saved for the connected monitors".into());
+    };
+    if !mirror::can_mirror(&outputs) {
+        if mirrors.is_empty() {
+            return Ok(());
+        }
+        return Err("this sway cannot mirror outputs".into());
+    }
+    let commands = mirror_commands(&mirrors, &outputs);
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let mut sway = Connection::new().await?;
+    for result in sway.run_command(commands.join("; ")).await? {
+        result?;
+    }
+    Ok(())
 }
 
 /// The connectors a profile names, with the description of the monitor it was
@@ -1365,6 +1475,74 @@ mod tests {
             fs::read_to_string(dir.join("invalid-profiles/Acme_View_24_0__Acme_View_24_0"))
                 .unwrap(),
             OLD_IDENTICAL_PROFILE
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_mirrors_are_read_from_the_profile_of_the_connected_monitors() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-mirrors-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        // A projector, named by its description, which comes from its EDID,
+        // mirrors a laptop panel; of two identical monitors, named by
+        // connector, DP-2 mirrors DP-1.
+        let manager = DisplayManager {
+            serial: 0,
+            monitors: vec![
+                laptop_panel(),
+                monitor("HDMI-A-1", "Beam", "P1 $(id)", "2"),
+                acme("DP-1"),
+                acme("DP-2"),
+            ],
+            logical_monitors: Vec::new(),
+            properties: DisplayManagerProperties::new(),
+        };
+        let (name, _) = manager.kanshi_profile_name();
+        assert_eq!(manager.saved_mirrors(&paths), None);
+        fs::write(
+            paths.profiles.join(name),
+            "profile {\n\
+             \toutput \"BOE 0x0BCA Unknown\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \t# regolith-displayd: mirror \"Beam P1 $(id) 2\" of \"BOE 0x0BCA Unknown\"\n\
+             \t# regolith-displayd: mirror \"DP-2\" of \"DP-1\"\n\
+             \t# regolith-displayd: mirror \"Gone 1 2\" of \"DP-1\"\n\
+             }\n",
+        )
+        .unwrap();
+        let mirrors = manager.saved_mirrors(&paths).unwrap();
+        let pair = |copy: &str, source: &str| (copy.to_string(), source.to_string());
+        // A monitor that isn't connected is left out.
+        assert_eq!(mirrors, [pair("HDMI-A-1", "eDP-1"), pair("DP-2", "DP-1")]);
+
+        // Now HDMI-A-1 mirrors DP-1, DP-2 already mirrors DP-1, and DP-3,
+        // which the profile doesn't record, still mirrors DP-1 from before.
+        let outputs = mirror::tests::from_reply(serde_json::json!([
+            mirror::tests::output("eDP-1", 0, None),
+            mirror::tests::output("HDMI-A-1", 1920, Some("DP-1")),
+            mirror::tests::output("DP-1", 1920, None),
+            mirror::tests::output("DP-2", 1920, Some("DP-1")),
+            mirror::tests::output("DP-3", 1920, Some("DP-1")),
+        ]));
+        assert_eq!(
+            mirror_commands(&mirrors, &outputs),
+            [
+                "output \"eDP-1\" mirror off",
+                "output \"HDMI-A-1\" mirror off",
+                "output \"DP-1\" mirror off",
+                "output \"DP-3\" mirror off",
+                "output \"HDMI-A-1\" mirror \"eDP-1\"",
+            ]
+        );
+        // A profile without mirrors turns every mirror off.
+        assert_eq!(
+            mirror_commands(&[], &outputs[3..]),
+            ["output \"DP-2\" mirror off", "output \"DP-3\" mirror off"]
         );
         let _ = fs::remove_dir_all(&dir);
     }

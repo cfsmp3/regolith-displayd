@@ -1,5 +1,5 @@
 use log::error;
-use regolith_displayd::{confirm, night_light, DisplayManager, DisplayServer};
+use regolith_displayd::{confirm, mirror, night_light, DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc};
 use swayipc_async::Connection as SwayConection;
 use tokio::{sync::Mutex, try_join};
@@ -12,7 +12,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         let millis = args[3].parse().unwrap_or(0);
         std::process::exit(confirm::run_prompt(&args[2], millis));
     }
+    // A kept profile in which outputs mirror others runs it with this
+    // argument once kanshi has applied it: kanshi cannot mirror outputs.
+    if args.len() == 2 && args[1] == mirror::RESTORE_ARG {
+        std::process::exit(restore_mirrors());
+    }
     daemon()
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn restore_mirrors() -> i32 {
+    match regolith_displayd::restore_saved_mirrors().await {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("regolith-displayd: cannot mirror the outputs again: {e}");
+            1
+        }
+    }
 }
 
 #[tokio::main]
