@@ -2,6 +2,7 @@ pub mod confirm;
 pub mod edid;
 pub mod gamma;
 pub mod labels;
+pub mod mirror;
 pub mod modes;
 pub mod monitor;
 pub mod night_light;
@@ -9,6 +10,7 @@ pub mod night_light;
 use core::fmt;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
+use mirror::SwayOutput;
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -582,22 +584,40 @@ impl DisplayManager {
         &mut self,
         sway_connection: &Mutex<Connection>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
-        let outputs = sway_connection.lock().await.get_outputs().await?;
-        let (mut monitors, logical_monitors) = Self::monitors_of(&outputs);
+        // Read the outputs while no command runs.
+        let _sway = sway_connection.lock().await;
+        let outputs = mirror::get_outputs()
+            .await
+            .map_err(|e| e as Box<dyn Error>)?;
+        Ok(self.monitor_info(&outputs))
+    }
+
+    /// The monitors and logical monitors of sway's `outputs`.
+    fn monitor_info(&self, outputs: &[SwayOutput]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
+        let (mut monitors, logical_monitors) = Self::monitors_of(outputs);
         for monitor in &mut monitors {
             monitor.keep_known_modes(&self.monitors);
         }
-        Ok((monitors, logical_monitors))
+        (monitors, logical_monitors)
     }
 
     /// The monitors of sway's `outputs`, and the logical monitors of the
-    /// active ones.
-    fn monitors_of(outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
-        let monitors = outputs.iter().map(Monitor::new).collect();
+    /// active ones. The outputs that mirror another one are monitors of that
+    /// output's logical monitor, as Mutter reports mirrored monitors, however
+    /// the mirroring was set up.
+    fn monitors_of(outputs: &[SwayOutput]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
+        let monitors = outputs.iter().map(|o| Monitor::new(&o.output)).collect();
         let logical_monitors = outputs
             .iter()
-            .filter(|o| o.active)
-            .map(LogicalMonitor::new)
+            .filter(|o| o.output.active && o.source(outputs).is_none())
+            .map(|source| {
+                let copies: Vec<&Output> = outputs
+                    .iter()
+                    .filter(|o| o.source(outputs) == Some(source.output.name.as_str()))
+                    .map(|o| &o.output)
+                    .collect();
+                LogicalMonitor::new(&source.output).with_copies(&copies)
+            })
             .collect();
         (monitors, logical_monitors)
     }
@@ -1731,12 +1751,13 @@ mod hotplug_tests {
         .unwrap()
     }
 
-    fn state(outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
-        DisplayManager::monitors_of(outputs)
+    fn state(outputs: impl IntoIterator<Item = Output>) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
+        let outputs: Vec<SwayOutput> = outputs.into_iter().map(SwayOutput::from).collect();
+        DisplayManager::monitors_of(&outputs)
     }
 
     /// A manager that has reported `outputs`, at serial 1.
-    fn reported(outputs: &[Output]) -> DisplayManager {
+    fn reported(outputs: impl IntoIterator<Item = Output>) -> DisplayManager {
         let mut manager = DisplayManager {
             serial: 0,
             monitors: Vec::new(),
@@ -1769,8 +1790,8 @@ mod hotplug_tests {
 
     #[test]
     fn an_unplugged_monitor_is_noticed() {
-        let mut manager = reported(&[dp1(), dp2()]);
-        let (monitors, logical_monitors) = state(&[dp1()]);
+        let mut manager = reported([dp1(), dp2()]);
+        let (monitors, logical_monitors) = state([dp1()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1"]);
         assert_eq!(manager.logical_monitors.len(), 1);
@@ -1779,8 +1800,8 @@ mod hotplug_tests {
 
     #[test]
     fn a_plugged_in_monitor_is_noticed() {
-        let mut manager = reported(&[dp1()]);
-        let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
+        let mut manager = reported([dp1()]);
+        let (monitors, logical_monitors) = state([dp1(), dp2()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1", "DP-2"]);
         assert_eq!(manager.serial, 2);
@@ -1795,12 +1816,12 @@ mod hotplug_tests {
             output.active = false;
             output
         };
-        let mut manager = reported(&[dp1(), disabled_dp2()]);
+        let mut manager = reported([dp1(), disabled_dp2()]);
         assert_eq!(manager.logical_monitors.len(), 1);
-        let (monitors, logical_monitors) = state(&[dp1(), disabled_dp2()]);
+        let (monitors, logical_monitors) = state([dp1(), disabled_dp2()]);
         assert_eq!(logical_monitors.len(), 1);
         assert!(!manager.update(monitors, logical_monitors));
-        let (monitors, logical_monitors) = state(&[dp1()]);
+        let (monitors, logical_monitors) = state([dp1()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1"]);
         assert_eq!(manager.serial, 2);
@@ -1808,21 +1829,21 @@ mod hotplug_tests {
 
     #[test]
     fn the_same_outputs_in_another_order_are_no_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
-        let (monitors, logical_monitors) = state(&[dp2(), dp1()]);
+        let mut manager = reported([dp1(), dp2()]);
+        let (monitors, logical_monitors) = state([dp2(), dp1()]);
         assert!(!manager.update(monitors, logical_monitors));
         assert_eq!(manager.serial, 1);
     }
 
     #[test]
     fn a_new_layout_or_mode_is_a_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
+        let mut manager = reported([dp1(), dp2()]);
         for changed in [
             sway_output("DP-2", 0, 1.0, 1920),    // moved
             sway_output("DP-2", 1920, 2.0, 1920), // scaled
             sway_output("DP-2", 1920, 2.0, 1280), // another mode
         ] {
-            let (monitors, logical_monitors) = state(&[dp1(), changed]);
+            let (monitors, logical_monitors) = state([dp1(), changed]);
             assert!(manager.update(monitors, logical_monitors));
             // The same monitors: a configuration for them is still valid.
             assert_eq!(manager.serial, 1);
@@ -1835,8 +1856,8 @@ mod hotplug_tests {
         // that compared equal but hashed differently was missed whenever the
         // two hashes happened to match closely enough (about 1 in 128).
         for _ in 0..1000 {
-            let mut manager = reported(&[dp1()]);
-            let (monitors, logical_monitors) = state(&[sway_output("DP-1", 0, 1.0, 1280)]);
+            let mut manager = reported([dp1()]);
+            let (monitors, logical_monitors) = state([sway_output("DP-1", 0, 1.0, 1280)]);
             assert!(manager.update(monitors, logical_monitors));
             assert_eq!(manager.serial, 1);
         }
@@ -1844,18 +1865,108 @@ mod hotplug_tests {
 
     #[test]
     fn outputs_that_swap_places_are_a_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
-        let (monitors, logical_monitors) = state(&[
+        let mut manager = reported([dp1(), dp2()]);
+        let (monitors, logical_monitors) = state([
             sway_output("DP-1", 1920, 1.0, 1920),
             sway_output("DP-2", 0, 1.0, 1920),
         ]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(manager.serial, 1);
-        let (monitors, logical_monitors) = state(&[
+        let (monitors, logical_monitors) = state([
             sway_output("DP-1", 1920, 1.0, 1920),
             sway_output("DP-2", 0, 1.0, 1920),
         ]);
         assert!(!manager.update(monitors, logical_monitors));
+    }
+
+    /// The connectors of each logical monitor.
+    fn logical_connectors(logical_monitors: &[LogicalMonitor]) -> Vec<Vec<&str>> {
+        logical_monitors
+            .iter()
+            .map(|logical| logical.connectors().collect())
+            .collect()
+    }
+
+    #[test]
+    fn mirrored_outputs_are_one_logical_monitor() {
+        // DP-1 at (1920, 0), rotated, mirrored by DP-3 in a mode of its own,
+        // which sway reports with DP-1's rectangle; DP-2 at (0, 0).
+        let mut dp1 = mirror::tests::output("DP-1", 1920, None);
+        dp1["transform"] = serde_json::json!("90");
+        dp1["rect"] = serde_json::json!({"x": 1920, "y": 0, "width": 1080, "height": 1920});
+        let mut dp3 = mirror::tests::output("DP-3", 1920, Some("DP-1"));
+        dp3["current_mode"] = serde_json::json!({"width": 1280, "height": 720, "refresh": 60000});
+        dp3["rect"] = dp1["rect"].clone();
+        // sway may list a mirror before its source.
+        let outputs = mirror::tests::from_reply(serde_json::json!([
+            dp3,
+            dp1,
+            mirror::tests::output("DP-2", 0, None)
+        ]));
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
+        assert_eq!(
+            logical_connectors(&logical_monitors),
+            [vec!["DP-1", "DP-3"], vec!["DP-2"]]
+        );
+        // In DP-1's place, with its rotation.
+        let reported = serde_json::to_value(&logical_monitors[0]).unwrap();
+        assert_eq!(
+            (&reported["x_pos"], &reported["transform"]),
+            (&serde_json::json!(1920), &serde_json::json!(1))
+        );
+        // Each monitor keeps its own mode.
+        assert_eq!(monitors[0].get_current_mode(), "1280x720@60Hz");
+        assert_eq!(monitors[1].get_current_mode(), "1920x1080@60Hz");
+    }
+
+    #[test]
+    fn mirroring_that_starts_stops_or_loses_its_source_is_a_change() {
+        let side_by_side = || {
+            mirror::tests::from_reply(serde_json::json!([
+                mirror::tests::output("DP-1", 0, None),
+                mirror::tests::output("DP-2", 1920, None)
+            ]))
+        };
+        let mirrored = || {
+            mirror::tests::from_reply(serde_json::json!([
+                mirror::tests::output("DP-1", 0, None),
+                mirror::tests::output("DP-2", 0, Some("DP-1"))
+            ]))
+        };
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&side_by_side());
+        let mut manager = DisplayManager {
+            serial: 1,
+            monitors,
+            logical_monitors,
+            properties: DisplayManagerProperties::new(),
+        };
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&mirrored());
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(
+            logical_connectors(&manager.logical_monitors),
+            [["DP-1", "DP-2"]]
+        );
+        // The same monitors: a configuration made for them is still valid.
+        assert_eq!(manager.serial, 1);
+
+        // DP-1 switched off: DP-2 shows its own part of the layout again,
+        // which sway gives it once it stops mirroring.
+        let mut off = mirror::tests::output("DP-1", 0, None);
+        off["active"] = serde_json::json!(false);
+        let outputs = mirror::tests::from_reply(serde_json::json!([
+            off,
+            mirror::tests::output("DP-2", 0, Some("DP-1"))
+        ]));
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(logical_connectors(&manager.logical_monitors), [["DP-2"]]);
+
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&side_by_side());
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(
+            logical_connectors(&manager.logical_monitors),
+            [["DP-1"], ["DP-2"]]
+        );
     }
 }
 
@@ -1865,10 +1976,10 @@ mod layout_tests {
 
     /// Two 1920x1080 monitors, DP-1 and DP-2.
     fn monitors() -> Vec<Monitor> {
-        let outputs: Vec<Output> = ["DP-1", "DP-2"]
+        let outputs: Vec<SwayOutput> = ["DP-1", "DP-2"]
             .iter()
             .map(|connector| {
-                serde_json::from_value(serde_json::json!({
+                serde_json::from_value::<Output>(serde_json::json!({
                     "id": 1, "name": connector, "make": "Acme", "model": connector,
                     "serial": "0", "active": true, "dpms": true, "primary": false,
                     "scale": 1.0, "transform": "normal",
@@ -1877,6 +1988,7 @@ mod layout_tests {
                     "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}
                 }))
                 .unwrap()
+                .into()
             })
             .collect();
         DisplayManager::monitors_of(&outputs).0
@@ -1995,10 +2107,10 @@ mod layout_tests {
     /// The primary GetCurrentState reports for these sway outputs: the
     /// connector, mode width and connector type of each.
     fn reported_primary(outputs: &[(&str, i32)], chosen: Option<&str>) -> String {
-        let outputs: Vec<Output> = outputs
+        let outputs: Vec<SwayOutput> = outputs
             .iter()
             .map(|(connector, width)| {
-                serde_json::from_value(serde_json::json!({
+                serde_json::from_value::<Output>(serde_json::json!({
                     "id": 1, "name": connector, "make": "Acme", "model": connector,
                     "serial": "0", "active": true, "dpms": true, "primary": false,
                     "scale": 1.0, "transform": "normal",
@@ -2007,6 +2119,7 @@ mod layout_tests {
                     "rect": {"x": 0, "y": 0, "width": width, "height": 1080}
                 }))
                 .unwrap()
+                .into()
             })
             .collect();
         let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
@@ -2301,7 +2414,7 @@ mod confirm_tests {
 
     #[test]
     fn sway_commands_disable_the_outputs_left_out() {
-        let outputs = outputs();
+        let outputs: Vec<SwayOutput> = outputs().into_iter().map(SwayOutput::from).collect();
         let (monitors, _) = DisplayManager::monitors_of(&outputs);
         let manager = DisplayManager {
             serial: 0,

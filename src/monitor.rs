@@ -260,6 +260,17 @@ impl MonitorProperties {
     }
 }
 
+/// The key that sorts connectors by type, then number: "DP-2" before "DP-10".
+pub fn connector_order(connector: &str) -> (&str, u64) {
+    let digits = connector
+        .bytes()
+        .rev()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let (kind, number) = connector.split_at(connector.len() - digits);
+    (kind, number.parse().unwrap_or(0))
+}
+
 /// Connector types of laptop panels, as Mutter tells them apart.
 fn is_laptop_panel(connector: &str) -> bool {
     ["eDP", "LVDS", "DSI"]
@@ -384,8 +395,31 @@ impl LogicalMonitor {
             },
         }
     }
+    /// This logical monitor, also shown on the outputs in `copies`, which
+    /// mirror its output. They are listed after it, in connector order.
+    pub fn with_copies(mut self, copies: &[&Output]) -> LogicalMonitor {
+        let mut copies = copies.to_vec();
+        copies.sort_by(|a, b| connector_order(&a.name).cmp(&connector_order(&b.name)));
+        self.monitors.extend(copies.iter().map(|output| {
+            (
+                output.name.clone(),
+                output.make.clone(),
+                output.model.clone(),
+                output.serial.clone(),
+            )
+        }));
+        self
+    }
+
+    /// The connector of the monitor that shows this logical monitor. Any
+    /// other monitor of it mirrors that one.
     pub fn connector(&self) -> &str {
         &self.monitors[0].0
+    }
+
+    /// The connectors of all the monitors that show this logical monitor.
+    pub fn connectors(&self) -> impl Iterator<Item = &str> {
+        self.monitors.iter().map(|monitor| monitor.0.as_str())
     }
 
     pub fn set_primary(&mut self, primary: bool) {
@@ -711,6 +745,25 @@ mod tests {
             LogicalMonitor::new(&placed_output("DP-1", 0, 1920)),
             LogicalMonitor::new(&placed_output("DP-1", 0, 1920))
         );
+    }
+
+    #[test]
+    fn mirrors_follow_their_source_in_connector_order() {
+        let logical = LogicalMonitor::new(&placed_output("HDMI-A-1", 0, 1920)).with_copies(&[
+            &placed_output("DP-10", 0, 1920),
+            &placed_output("eDP-1", 0, 1920),
+            &placed_output("DP-2", 0, 1920),
+        ]);
+        let connectors: Vec<&str> = logical.connectors().collect();
+        assert_eq!(connectors, ["HDMI-A-1", "DP-2", "DP-10", "eDP-1"]);
+        assert_eq!(logical.connector(), "HDMI-A-1");
+        // A logical monitor shown on another monitor too is another one.
+        assert_ne!(
+            logical,
+            LogicalMonitor::new(&placed_output("HDMI-A-1", 0, 1920))
+        );
+        assert_eq!(connector_order("HEADLESS-12"), ("HEADLESS-", 12));
+        assert_eq!(connector_order("WL"), ("WL", 0));
     }
 
     #[test]
