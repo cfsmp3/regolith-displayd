@@ -1,0 +1,326 @@
+#!/bin/bash
+# Mirroring through regolith-displayd's DisplayConfig API, on a headless sway
+# that mirrors outputs (`output <name> mirror <source>`, as sway-regolith
+# does) with a real kanshi and two outputs. Skipped on a sway that cannot
+# mirror.
+#
+# Mirroring set up with swaymsg must be reported as one logical monitor, with
+# MonitorsChanged, and an exact repeat of that state must be accepted even for
+# a pair Settings could not ask for, with its monitors in any order. A
+# temporary Apply that mirrors must keep the desktop on the primary output and
+# take effect without writing a profile, and Join must end it. A persistent
+# one must come back as it was on Escape, and once kept with Enter, the
+# outputs must mirror again after a fresh login, through the profile kanshi
+# applies. When the mirrored output is switched off, the other one must be
+# reported on its own. A Join kept afterwards must end a mirror left in sway
+# whenever kanshi applies it, and must not mirror at the next login.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+profiles="$HOME/.config/regolith3/kanshi/profiles"
+mode=1600x1000
+pids=()
+session=()
+
+cleanup() {
+    kill "${session[@]}" "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.25 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.25
+    done
+    return 1
+}
+
+dc() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
+}
+
+# The logical monitors GetCurrentState reports, one per line, sorted:
+# "<x>,<y> <scale> <transform> <primary|-> <connector>[+<connector>...]".
+logical() {
+    python3 -c '
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+state = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                      "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                      Gio.DBusCallFlags.NONE, 5000, None).unpack()
+for x, y, scale, transform, primary, monitors, _ in sorted(state[2]):
+    print("%d,%d %g %d %s %s" % (x, y, scale, transform, "primary" if primary else "-",
+                                 "+".join(m[0] for m in monitors)))'
+}
+
+logical_is() {
+    [ "$(logical)" = "$1" ]
+}
+
+# The monitors of each logical monitor, wherever they are.
+logical_monitors_are() {
+    [ "$(logical | awk '{print $NF}')" = "$1" ]
+}
+
+serial() {
+    dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/'
+}
+
+# apply <method> <logical monitors, as "(x, y, scale, transform, primary, [monitors])">
+apply() {
+    dc ApplyMonitorsConfig "$(serial)" "$1" "[$2]" "@a{sv} {}"
+}
+
+# The mode of <output> as GetCurrentState names it.
+mode_of() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+mode = next(o for o in json.load(sys.stdin) if o["name"] == sys.argv[1])["current_mode"]
+print("%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))' "$1"
+}
+
+mon() {
+    echo "('$1', '$(mode_of "$1")', @a{sv} {})"
+}
+
+# Whether GetCurrentState reports the mode sway runs <output> in as current:
+# regolith-displayd follows sway's outputs every 700 ms.
+reports_mode_of() {
+    python3 -c '
+import sys, gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+state = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                      "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                      Gio.DBusCallFlags.NONE, 5000, None).unpack()
+monitor = next(m for m in state[1] if m[0][0] == sys.argv[1])
+sys.exit(not any(mode[0] == sys.argv[2] and mode[6].get("is-current") for mode in monitor[1]))' "$1" "$(mode_of "$1")"
+}
+
+# What sway reports for each output: "<name> <active> <mirror|-> <x>,<y>".
+sway_outputs() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+for o in sorted(json.load(sys.stdin), key=lambda o: o["name"]):
+    print(o["name"], o["active"], o.get("mirror") or "-", "%d,%d" % (o["rect"]["x"], o["rect"]["y"]))'
+}
+
+mirrors() {
+    sway_outputs | grep -qx "HEADLESS-2 True HEADLESS-1 0,0"
+}
+
+side_by_side() {
+    sway_outputs | grep -qx "HEADLESS-1 True - 0,0" && sway_outputs | grep -qx "HEADLESS-2 True - 1600,0"
+}
+
+profile_files() {
+    ls "$profiles"
+}
+
+signals() {
+    grep -c MonitorsChanged "$work/signals.log" || true
+}
+
+more_signals_than() {
+    [ "$(signals)" -gt "$1" ]
+}
+
+ms_since() {
+    echo $(( ($(date +%s%N) - $1) / 1000000 ))
+}
+
+# A session: sway with two 1600x1000 outputs side by side, then
+# regolith-displayd-init, regolith-displayd and kanshi, in the order of
+# regolith-init-displayd.service and regolith-init-kanshi.service. Sets
+# $ready to when regolith-displayd served both outputs and $kanshi, and follows
+# MonitorsChanged in signals.log.
+start_session() {
+    sway -c "$work/sway.cfg" >> "$work/sway.log" 2>&1 &
+    session=($!)
+    retry 80 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+    SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+    export SWAYSOCK
+    retry 40 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+    WAYLAND_DISPLAY=$(compgen -G "$XDG_RUNTIME_DIR/wayland-*" | grep -v '\.lock$' | head -n 1)
+    WAYLAND_DISPLAY=${WAYLAND_DISPLAY##*/}
+    export WAYLAND_DISPLAY
+    swaymsg -q create_output
+    swaymsg -q output HEADLESS-2 mode "$mode" position 1600 0
+    retry 40 side_by_side || fail "sway did not set up two outputs side by side: $(sway_outputs)"
+    regolith-displayd-init > /dev/null
+    RUST_LOG=info regolith-displayd >> "$work/displayd.log" 2>&1 &
+    session+=($!)
+    displayd=$!
+    retry 80 sh -c 'gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2> /dev/null | grep -q HEADLESS-2' \
+        || fail "regolith-displayd does not serve both outputs"
+    ready=$(date +%s%N)
+    gdbus monitor --session --dest org.gnome.Mutter.DisplayConfig > "$work/signals.log" 2>&1 &
+    session+=($!)
+    kanshi -c "$HOME/.config/regolith3/kanshi/config" >> "$work/kanshi.log" 2>&1 &
+    kanshi=$!
+    session+=("$kanshi")
+}
+
+stop_session() {
+    kill "${session[@]}" 2>/dev/null || true
+    for pid in "${session[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    session=()
+    retry 40 no_sway_socket || rm -f "$XDG_RUNTIME_DIR"/sway-ipc.*.sock
+}
+
+no_sway_socket() {
+    ! compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null
+}
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 40 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+printf 'xwayland disable\noutput HEADLESS-1 mode %s position 0 0\n' "$mode" > "$work/sway.cfg"
+start_session
+if ! swaymsg -t get_outputs | python3 -c 'import json, sys; sys.exit(not all("mirror" in o for o in json.load(sys.stdin)))'; then
+    echo "SKIP: this sway cannot mirror outputs"
+    exit 77
+fi
+sleep 1
+retry 20 logical_is $'0,0 1 0 primary HEADLESS-1\n1600,0 1 0 - HEADLESS-2' \
+    || fail "two outputs side by side are not reported as such: $(logical)"
+echo "ok: two outputs side by side"
+
+# Mirroring set up outside Settings.
+before=$(signals)
+swaymsg -q output HEADLESS-2 mirror HEADLESS-1
+retry 12 logical_is "0,0 1 0 primary HEADLESS-1+HEADLESS-2" \
+    || fail "mirroring set up with swaymsg is not reported as one logical monitor: $(logical)"
+retry 12 more_signals_than "$before" || fail "no MonitorsChanged when mirroring started"
+echo "ok: mirroring set up with swaymsg is one logical monitor, with MonitorsChanged"
+before=$(signals)
+swaymsg -q output HEADLESS-2 mirror off
+retry 12 logical_is $'0,0 1 0 primary HEADLESS-1\n1600,0 1 0 - HEADLESS-2' \
+    || fail "mirroring stopped with swaymsg is still reported: $(logical)"
+retry 12 more_signals_than "$before" || fail "no MonitorsChanged when mirroring stopped"
+echo "ok: mirroring stopped with swaymsg is reported, with MonitorsChanged"
+
+# A pair Settings could not ask for: a mirror in a mode of another size. Its
+# exact repeat is accepted and changes nothing; a new such pair is refused.
+swaymsg -q output HEADLESS-2 mode 1280x800 mirror HEADLESS-1
+retry 12 logical_is "0,0 1 0 primary HEADLESS-1+HEADLESS-2" || fail "the 1280x800 mirror is not reported: $(logical)"
+retry 12 reports_mode_of HEADLESS-2 || fail "HEADLESS-2 is not reported in 1280x800"
+# The Displays panel sends a logical monitor's monitors in no particular order.
+pair="(0, 0, 1.0, 0, true, [$(mon HEADLESS-2), $(mon HEADLESS-1)])"
+apply 1 "$pair" > /dev/null || fail "the exact repeat of a mirror set up with swaymsg was refused"
+mirrors || fail "the exact repeat changed the outputs: $(sway_outputs)"
+swaymsg -q output HEADLESS-2 mirror off position 1600 0
+retry 12 logical_is $'0,0 1 0 primary HEADLESS-1\n1600,0 1 0 - HEADLESS-2' || fail "HEADLESS-2 did not stop mirroring"
+if apply 1 "(0, 0, 1.0, 0, true, [$(mon HEADLESS-1), $(mon HEADLESS-2)])" > /dev/null 2>&1; then
+    fail "a new mirror of modes of different sizes was accepted"
+fi
+sway_outputs | grep -q "^HEADLESS-2 True - " || fail "a refused Apply changed the outputs: $(sway_outputs)"
+swaymsg -q output HEADLESS-2 mode "$mode" position 1600 0
+retry 12 side_by_side || fail "HEADLESS-2 did not go back to $mode"
+retry 12 reports_mode_of HEADLESS-2 || fail "HEADLESS-2 is not reported in $mode again"
+echo "ok: the exact repeat of a 1280x800 mirror is accepted, a new one refused"
+
+# Temporary: takes effect, writes nothing; Join ends it.
+saved=$(profile_files)
+pair="(0, 0, 1.0, 0, true, [$(mon HEADLESS-1), $(mon HEADLESS-2)])"
+join="(0, 0, 1.0, 0, true, [$(mon HEADLESS-1)]), (1600, 0, 1.0, 0, false, [$(mon HEADLESS-2)])"
+start=$(date +%s%N)
+# HEADLESS-1, the primary, keeps the desktop, whichever comes first.
+apply 1 "(0, 0, 1.0, 0, true, [$(mon HEADLESS-2), $(mon HEADLESS-1)])" > /dev/null || fail "a temporary Apply that mirrors failed"
+retry 12 mirrors || fail "the temporary Apply did not mirror HEADLESS-1, the primary, on HEADLESS-2: $(sway_outputs)"
+echo "ok: a temporary Apply mirrors HEADLESS-1 on HEADLESS-2 ($(ms_since "$start") ms)"
+retry 12 logical_is "0,0 1 0 primary HEADLESS-1+HEADLESS-2" || fail "the mirror is not reported: $(logical)"
+[ "$(profile_files)" = "$saved" ] || fail "a temporary Apply wrote a profile"
+apply 1 "$join" > /dev/null || fail "Join failed"
+retry 12 side_by_side || fail "Join did not end the mirroring: $(sway_outputs)"
+echo "ok: the temporary Apply wrote nothing, and Join ended it"
+
+# Persistent, answered with Escape: back to side by side, nothing saved.
+apply 2 "$pair" > /dev/null || fail "a persistent Apply that mirrors failed"
+retry 12 mirrors || fail "the persistent Apply did not mirror: $(sway_outputs)"
+before=$(signals)
+wtype -s 500 -k Escape || fail "could not press Escape"
+start=$(date +%s%N)
+retry 12 side_by_side || fail "Escape did not bring the outputs back side by side: $(sway_outputs)"
+echo "ok: Escape brought the outputs back side by side ($(ms_since "$start") ms after the key)"
+retry 12 more_signals_than "$before" || fail "no MonitorsChanged after the revert"
+[ "$(profile_files)" = "$saved" ] || fail "a reverted Apply wrote a profile"
+
+# Persistent, kept with Enter: saved with the mirror.
+apply 2 "$pair" > /dev/null || fail "a persistent Apply that mirrors failed"
+retry 12 mirrors || fail "the persistent Apply did not mirror: $(sway_outputs)"
+wtype -s 500 -k Return || fail "could not press Enter"
+retry 20 sh -c "grep -qsx '# regolith-displayd: mirror \"HEADLESS-2\" of \"HEADLESS-1\"' '$profiles'/*" \
+    || fail "the kept mirror was not saved: $(cat "$profiles"/*)"
+grep -qsx $'\texec regolith-displayd --restore-mirrors' "$profiles"/* || fail "the profile does not restore the mirror: $(cat "$profiles"/*)"
+sleep 2
+mirrors || fail "the kept mirror did not stay: $(sway_outputs)"
+echo "ok: a persistent Apply kept with Enter is saved with the mirror"
+
+# A fresh login: everything starts again from sway, side by side.
+stop_session
+start_session
+retry 40 mirrors || fail "the kept mirror did not come back at login: $(sway_outputs); kanshi: $(tail -n 5 "$work/kanshi.log")"
+echo "ok: the kept mirror came back at login ($(ms_since "$ready") ms after regolith-displayd was ready)"
+retry 12 logical_is "0,0 1 0 primary HEADLESS-1+HEADLESS-2" || fail "the mirror is not reported after login: $(logical)"
+sleep 1
+
+# The mirrored output switched off: the other one shows itself again.
+before=$(signals)
+swaymsg -q output HEADLESS-1 disable
+start=$(date +%s%N)
+retry 12 logical_monitors_are "HEADLESS-2" || fail "HEADLESS-2 is not reported on its own without its source: $(logical)"
+echo "ok: with HEADLESS-1 off, HEADLESS-2 is reported on its own ($(ms_since "$start") ms)"
+retry 12 more_signals_than "$before" || fail "no MonitorsChanged when the source went away"
+swaymsg -q output HEADLESS-1 enable
+retry 12 logical_monitors_are "HEADLESS-1+HEADLESS-2" || fail "the mirror did not resume with HEADLESS-1: $(logical)"
+
+# Join, kept: no mirror at the next login.
+apply 2 "$join" > /dev/null || fail "a persistent Join failed"
+retry 12 side_by_side || fail "Join did not end the mirroring: $(sway_outputs)"
+wtype -s 500 -k Return || fail "could not press Enter"
+retry 20 sh -c "! grep -qs '^# regolith-displayd: mirror' '$profiles'/*" || fail "the kept Join still records a mirror: $(cat "$profiles"/*)"
+# sway keeps a mirror setting until it is turned off, and kanshi cannot turn
+# it off: the kept profile does, each time kanshi applies it.
+swaymsg -q output HEADLESS-2 mirror HEADLESS-1
+retry 12 mirrors || fail "HEADLESS-2 did not mirror with swaymsg"
+kill -HUP "$kanshi"
+retry 20 side_by_side || fail "kanshi applying the kept Join did not end the mirror: $(sway_outputs)"
+echo "ok: kanshi applying the kept Join ends a mirror left in sway"
+stop_session
+start_session
+sleep 3
+side_by_side || fail "the outputs mirror again after a Join was kept: $(sway_outputs)"
+echo "ok: a Join kept after the mirror is side by side at the next login"
+
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"
