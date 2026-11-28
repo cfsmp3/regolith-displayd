@@ -1,5 +1,5 @@
 use log::error;
-use regolith_displayd::{confirm, night_light, DisplayManager, DisplayServer};
+use regolith_displayd::{color, confirm, night_light, DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc};
 use swayipc_async::Connection as SwayConection;
 use tokio::{sync::Mutex, try_join};
@@ -27,6 +27,9 @@ async fn daemon() -> Result<(), Box<dyn Error>> {
     let sway_connection_ref = Arc::new(Mutex::new(sway_connection));
     let server =
         DisplayServer::new(Arc::clone(&manager_ref), Arc::clone(&sway_connection_ref)).await;
+    // Register the outputs with colord and apply their colour profiles, as
+    // GNOME's compositor does, without waiting for the bus name.
+    color::spawn(server.primary_monitor());
     server.run_server().await.unwrap();
 
     // Apply the color plugin's Night Light temperature, as Mutter does.

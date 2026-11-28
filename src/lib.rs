@@ -1,3 +1,4 @@
+pub mod color;
 pub mod confirm;
 pub mod edid;
 pub mod gamma;
@@ -49,6 +50,10 @@ const PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Numbers the persistent changes, so that an answer to one that another
 /// change has replaced is ignored.
 static CONFIRMATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts the `MonitorsChanged` signals: the monitors, the layout or the
+/// primary monitor may have changed since a reader last looked.
+static MONITORS_CHANGES: AtomicU64 = AtomicU64::new(0);
 
 /// A persistent change awaiting the user's answer. Dropping it cancels the
 /// confirmation and closes its prompt.
@@ -123,15 +128,7 @@ impl DisplayServer {
         info!("Recieved 'GetCurrentState' request from control-center");
         let mut state = self.manager.lock().await.clone();
         let remembered = self.primary.lock().await.clone();
-        let chosen = match &remembered {
-            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
-                Some(connector.clone())
-            }
-            _ => match get_kanshi_paths().await {
-                Ok(paths) => state.saved_primary(&paths),
-                Err(_) => None,
-            },
-        };
+        let chosen = chosen_primary(&state, remembered).await;
         state.mark_primary(chosen.as_deref());
         state
     }
@@ -320,6 +317,14 @@ impl DisplayServer {
             manager,
             sway_connection,
             primary: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// What tells which monitor this server reports as primary, for the
+    /// other parts of the daemon (see [`PrimaryMonitor`]).
+    pub fn primary_monitor(&self) -> PrimaryMonitor {
+        PrimaryMonitor {
+            chosen: Arc::clone(&self.primary),
         }
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
@@ -562,6 +567,7 @@ impl DisplayManager {
     }
 
     pub async fn emit_monitors_changed() -> zbus::Result<()> {
+        MONITORS_CHANGES.fetch_add(1, Ordering::Relaxed);
         let connection = ZBUS_CONNECTION.lock().await;
         info!("Emiting monitor changed");
         if let Some(con) = &*connection {
@@ -627,6 +633,58 @@ impl DisplayManager {
     }
 }
 
+/// The primary monitor that `GetCurrentState` reports, for the parts of the
+/// daemon that follow it, such as the colour devices (see [`color`]).
+#[derive(Clone)]
+pub struct PrimaryMonitor {
+    /// The primary chosen by the last Apply (see [`PrimaryChoice`]).
+    chosen: Arc<Mutex<Option<PrimaryChoice>>>,
+}
+
+impl PrimaryMonitor {
+    /// The connector of the monitor `GetCurrentState` reports as primary
+    /// while sway has these `outputs`, if any is on.
+    pub async fn connector(&self, outputs: &[Output]) -> Option<String> {
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(outputs);
+        let mut state = DisplayManager {
+            serial: 0,
+            monitors,
+            logical_monitors,
+            properties: DisplayManagerProperties::new(),
+        };
+        let remembered = self.chosen.lock().await.clone();
+        let chosen = chosen_primary(&state, remembered).await;
+        state.mark_primary(chosen.as_deref());
+        state
+            .logical_monitors
+            .iter()
+            .find(|logical| logical.is_primary())
+            .map(|logical| logical.connector().to_string())
+    }
+
+    /// A number that changes whenever the monitors, the layout or the
+    /// primary monitor may have changed: each `MonitorsChanged` signal.
+    pub fn changes(&self) -> u64 {
+        MONITORS_CHANGES.load(Ordering::Relaxed)
+    }
+}
+
+/// The primary monitor chosen for the monitors of `state`, by connector: the
+/// one the last Apply chose for these monitors, or else the one saved with
+/// their kanshi profile. [`DisplayManager::mark_primary`] falls back from it.
+async fn chosen_primary(
+    state: &DisplayManager,
+    remembered: Option<PrimaryChoice>,
+) -> Option<String> {
+    match remembered {
+        Some((set, connector)) if set == monitor_set(&state.monitors) => Some(connector),
+        _ => match get_kanshi_paths().await {
+            Ok(paths) => state.saved_primary(&paths),
+            Err(_) => None,
+        },
+    }
+}
+
 /// Whether `a` and `b` hold the same elements, in any order.
 fn same_set<T: Eq + Hash>(a: &[T], b: &[T]) -> bool {
     a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
@@ -682,7 +740,7 @@ impl Error for ServerError {
 /// entry, for the environments that don't set `$HOME`. That is what std's
 /// home_dir does on Unix (getpwuid_r); it is deprecated only because of its
 /// Windows behaviour.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     #[allow(deprecated)]
     std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
 }
